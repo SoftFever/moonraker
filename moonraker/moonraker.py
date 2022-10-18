@@ -40,11 +40,11 @@ from typing import (
 if TYPE_CHECKING:
     from websockets import WebRequest, WebsocketManager
     from components.file_manager.file_manager import FileManager
+    from components.machine import Machine
     FlexCallback = Callable[..., Optional[Coroutine]]
     _T = TypeVar("_T")
 
 API_VERSION = (1, 0, 5)
-
 CORE_COMPONENTS = [
     'dbus_manager', 'database', 'file_manager', 'klippy_apis',
     'machine', 'data_store', 'shell_command', 'proc_stats',
@@ -64,6 +64,11 @@ class Server:
         self.event_loop = event_loop
         self.file_logger = file_logger
         self.app_args = args
+        self.events: Dict[str, List[FlexCallback]] = {}
+        self.components: Dict[str, Any] = {}
+        self.failed_components: List[str] = []
+        self.warnings: Dict[str, str] = {}
+
         self.config = config = self._parse_config()
         self.host: str = config.get('host', "0.0.0.0")
         self.port: int = config.getint('port', 7125)
@@ -72,22 +77,18 @@ class Server:
         self.server_running: bool = False
 
         # Configure Debug Logging
-        self.debug = config.getboolean('enable_debug_logging', False)
-        asyncio_debug = config.getboolean('enable_asyncio_debug', False)
-        log_level = logging.DEBUG if self.debug else logging.INFO
+        config.getboolean('enable_debug_logging', False, deprecate=True)
+        self.debug = args["debug"]
+        log_level = logging.DEBUG if args["verbose"] else logging.INFO
         logging.getLogger().setLevel(log_level)
-        self.event_loop.set_debug(asyncio_debug)
+        self.event_loop.set_debug(args["asyncio_debug"])
 
-        # Event initialization
-        self.events: Dict[str, List[FlexCallback]] = {}
-        self.components: Dict[str, Any] = {}
-        self.failed_components: List[str] = []
-        self.warnings: Dict[str, str] = {}
         self.klippy_connection = KlippyConnection(config)
 
         # Tornado Application/Server
         self.moonraker_app = app = MoonrakerApp(config)
         self.register_endpoint = app.register_local_handler
+        self.register_debug_endpoint = app.register_debug_handler
         self.register_static_file_handler = app.register_static_file_handler
         self.register_upload_handler = app.register_upload_handler
         self.register_api_transport = app.register_api_transport
@@ -124,6 +125,9 @@ class Server:
 
     def is_debug_enabled(self) -> bool:
         return self.debug
+
+    def is_verbose_enabled(self) -> bool:
+        return self.app_args["verbose"]
 
     def _parse_config(self) -> confighelper.ConfigHelper:
         config = confighelper.get_configuration(self, self.app_args)
@@ -162,6 +166,10 @@ class Server:
 
         if not self.warnings:
             await self.event_loop.run_in_thread(self.config.create_backup)
+
+        machine: Machine = self.lookup_component("machine")
+        if await machine.validate_installation():
+            return
 
         if start_server:
             await self.start_server()
@@ -433,20 +441,41 @@ class Server:
         }
 
 def main(cmd_line_args: argparse.Namespace) -> None:
-    cfg_file = cmd_line_args.configfile
-    app_args = {'config_file': cfg_file}
-
     startup_warnings: List[str] = []
-    app_args["startup_warnings"] = startup_warnings
+    dp: str = cmd_line_args.datapath or "~/printer_data"
+    data_path = pathlib.Path(dp).expanduser().resolve()
+    if not data_path.exists():
+        try:
+            data_path.mkdir()
+        except Exception:
+            startup_warnings.append(
+                f"Unable to create data path folder at {data_path}"
+            )
+    if cmd_line_args.configfile is not None:
+        cfg_file: str = cmd_line_args.configfile
+    else:
+        cfg_file = str(data_path.joinpath("config/moonraker.conf"))
+    app_args = {
+        "data_path": str(data_path),
+        "is_default_data_path": cmd_line_args.datapath is None,
+        "config_file": cfg_file,
+        "startup_warnings": startup_warnings,
+        "verbose": cmd_line_args.verbose,
+        "debug": cmd_line_args.debug,
+        "asyncio_debug": cmd_line_args.asyncio_debug
+    }
+
     # Setup Logging
     version = utils.get_software_version()
     if cmd_line_args.nologfile:
-        app_args['log_file'] = ""
-    else:
-        app_args['log_file'] = os.path.normpath(
+        app_args["log_file"] = ""
+    elif cmd_line_args.logfile:
+        app_args["log_file"] = os.path.normpath(
             os.path.expanduser(cmd_line_args.logfile))
-    app_args['software_version'] = version
-    app_args['python_version'] = sys.version.replace("\n", " ")
+    else:
+        app_args["log_file"] = str(data_path.joinpath("logs/moonraker.log"))
+    app_args["software_version"] = version
+    app_args["python_version"] = sys.version.replace("\n", " ")
     ql, file_logger, warning = utils.setup_logging(app_args)
     if warning is not None:
         startup_warnings.append(warning)
@@ -465,7 +494,7 @@ def main(cmd_line_args: argparse.Namespace) -> None:
             if alt_config_loaded or backup_cfg is None:
                 estatus = 1
                 break
-            app_args['config_file'] = backup_cfg
+            app_args["config_file"] = backup_cfg
             warn_list = list(startup_warnings)
             app_args["startup_warnings"] = warn_list
             warn_list.append(
@@ -493,7 +522,7 @@ def main(cmd_line_args: argparse.Namespace) -> None:
         # Restore the original config and clear the warning
         # before the server restarts
         if alt_config_loaded:
-            app_args['config_file'] = cfg_file
+            app_args["config_file"] = cfg_file
             app_args["startup_warnings"] = startup_warnings
             alt_config_loaded = False
         event_loop.close()
@@ -513,13 +542,29 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="Moonraker - Klipper API Server")
     parser.add_argument(
-        "-c", "--configfile", default="~/moonraker.conf",
-        metavar='<configfile>',
+        "-d", "--datapath", default=None,
+        metavar='<data path>',
+        help="Location of Moonraker Data File Path"
+    )
+    parser.add_argument(
+        "-c", "--configfile", default=None, metavar='<configfile>',
         help="Location of moonraker configuration file")
     parser.add_argument(
-        "-l", "--logfile", default="/tmp/moonraker.log", metavar='<logfile>',
+        "-l", "--logfile", default=None, metavar='<logfile>',
         help="log file name and location")
     parser.add_argument(
         "-n", "--nologfile", action='store_true',
         help="disable logging to a file")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose logging"
+    )
+    parser.add_argument(
+        "-g", "--debug", action="store_true",
+        help="Enable Moonraker debug features"
+    )
+    parser.add_argument(
+        "-o", "--asyncio-debug", action="store_true",
+        help="Enable asyncio debug flag"
+    )
     main(parser.parse_args())

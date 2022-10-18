@@ -13,6 +13,7 @@ import time
 import pathlib
 import base64
 import tornado.websocket
+from tornado.escape import url_escape
 from websockets import Subscribable, WebRequest
 
 import logging.handlers
@@ -23,7 +24,6 @@ from utils import LocalQueueHandler
 from typing import (
     TYPE_CHECKING,
     Awaitable,
-    Coroutine,
     Optional,
     Dict,
     List,
@@ -50,12 +50,11 @@ COMPONENT_VERSION = "0.0.1"
 SP_VERSION = "0.1"
 TEST_ENDPOINT = f"wss://testws.simplyprint.io/{SP_VERSION}/p"
 PROD_ENDPOINT = f"wss://ws.simplyprint.io/{SP_VERSION}/p"
-KEEPALIVE_TIME = 96.0
 # TODO: Increase this time to something greater, perhaps 30 minutes
 CONNECTION_ERROR_LOG_TIME = 60.
 PRE_SETUP_EVENTS = [
-    "connection", "state_change", "shutdown", "machine_data", "keepalive",
-    "firmware"
+    "connection", "state_change", "shutdown", "machine_data", "firmware",
+    "ping"
 ]
 
 class SimplyPrint(Subscribable):
@@ -78,7 +77,6 @@ class SimplyPrint(Subscribable):
         self.amb_detect = AmbientDetect(config, self, ambient)
         self.layer_detect = LayerDetect()
         self.webcam_stream = WebcamStream(config, self)
-        self.ai_stream = AIStream(config, self)
         self.print_handler = PrintHandler(self)
         self.last_received_temps: Dict[str, float] = {}
         self.last_err_log_time: float = 0.
@@ -88,16 +86,18 @@ class SimplyPrint(Subscribable):
             "temps": 1.,
             "temps_target": .25,
             "cpu": 10.,
-            "ai": 0.
+            "ai": 0.,
+            "ping": 20.,
         }
         self.printer_status: Dict[str, Dict[str, Any]] = {}
         self.heaters: Dict[str, str] = {}
         self.missed_job_events: List[Dict[str, Any]] = []
         self.announce_mutex = asyncio.Lock()
-        self.keepalive_hdl: Optional[asyncio.TimerHandle] = None
         self.connection_task: Optional[asyncio.Task] = None
         self.reconnect_delay: float = 1.
         self.reconnect_token: Optional[str] = None
+        self._last_sp_ping: float = 0.
+        self.ping_sp_timer = self.eventloop.register_timer(self._handle_sp_ping)
         self.printer_info_timer = self.eventloop.register_timer(
             self._handle_printer_info_update)
         self._print_request_event: asyncio.Event = asyncio.Event()
@@ -241,7 +241,7 @@ class SimplyPrint(Subscribable):
             if isinstance(message, str):
                 self._process_message(message)
             elif message is None:
-                self.webcam_stream.stop()
+                self.ping_sp_timer.stop()
                 cur_time = self.eventloop.get_loop_time()
                 ping_time: float = cur_time - self._last_ping_received
                 reason = code = None
@@ -256,9 +256,6 @@ class SimplyPrint(Subscribable):
                 logging.info(msg)
                 self.connected = False
                 self.ws = None
-                if self.keepalive_hdl is not None:
-                    self.keepalive_hdl.cancel()
-                    self.keepalive_hdl = None
                 break
 
     def _on_ws_ping(self, data: bytes = b"") -> None:
@@ -266,7 +263,6 @@ class SimplyPrint(Subscribable):
 
     def _process_message(self, msg: str) -> None:
         self._logger.info(f"received: {msg}")
-        self._reset_keepalive()
         try:
             packet: Dict[str, Any] = json.loads(msg)
         except json.JSONDecodeError:
@@ -296,6 +292,7 @@ class SimplyPrint(Subscribable):
                     self.save_item("printer_name", name)
             self.reconnect_delay = 1.
             self._push_initial_state()
+            self.ping_sp_timer.start()
         elif event == "error":
             logging.info(f"SimplyPrint Connection Error: {data}")
             self.reconnect_delay = 30.
@@ -343,6 +340,9 @@ class SimplyPrint(Subscribable):
         elif event == "interval_change":
             if isinstance(data, dict):
                 self._update_intervals(data)
+        elif event == "pong":
+            diff = self.eventloop.get_loop_time() - self._last_sp_ping
+            self.send_sp("latency", {"ms": int(diff * 1000 + .5)})
         else:
             # TODO: It would be good for the backend to send an
             # event indicating that it is ready to recieve printer
@@ -367,11 +367,8 @@ class SimplyPrint(Subscribable):
                 script = "\n".join(script_list)
                 coro = self.klippy_apis.run_gcode(script, None)
                 self.eventloop.create_task(coro)
-        elif demand == "stream_on":
-            interval: float = args.get("interval", 1000) / 1000
-            self.webcam_stream.start(interval)
-        elif demand == "stream_off":
-            self.webcam_stream.stop()
+        elif demand == "webcam_snapshot":
+            self.eventloop.create_task(self.webcam_stream.post_image(args))
         elif demand == "file":
             url: Optional[str] = args.get("url")
             if not isinstance(url, str):
@@ -436,15 +433,11 @@ class SimplyPrint(Subscribable):
                 self.connect_url = f"{ep}/{printer_id}/{token}"
 
     def _update_intervals(self, intervals: Dict[str, Any]) -> None:
-        prev_ai = self.intervals.get("ai", 0.)
         for key, val in intervals.items():
             self.intervals[key] = val / 1000.
-        cur_ai = self.intervals.get("ai", prev_ai)
-        if abs(prev_ai - cur_ai) > 1e-8:
-            if abs(cur_ai) < 1e-8:
-                self.ai_stream.stop()
-            else:
-                self.ai_stream.start(cur_ai)
+        cur_ai_interval = self.intervals.get("ai", 0.)
+        if not cur_ai_interval:
+            self.webcam_stream.stop_ai()
         logging.debug(f"Intervals Updated: {self.intervals}")
 
     async def _announce_setup(self, short_id: str) -> None:
@@ -545,6 +538,8 @@ class SimplyPrint(Subscribable):
             "gcode_move": ["gcode_position"]
         }
         # Add Heater Subscriptions
+        has_amb_sensor: bool = False
+        cfg_amb_sensor = self.amb_detect.sensor_name
         if query is not None:
             heaters: Dict[str, Any] = query.get("heaters", {})
             avail_htrs: List[str]
@@ -561,6 +556,16 @@ class SimplyPrint(Subscribable):
                 elif htr == "heater_bed":
                     sub_objs[htr] = ["temperature", "target"]
                     self.heaters[htr] = "bed"
+            sensors: List[str] = heaters.get("available_sensors", [])
+            if cfg_amb_sensor:
+                if cfg_amb_sensor in sensors:
+                    has_amb_sensor = True
+                    sub_objs[cfg_amb_sensor] = ["temperature"]
+                else:
+                    logging.info(
+                        f"SimplyPrint: Ambient sensor {cfg_amb_sensor} not "
+                        "configured in Klipper"
+                    )
         if self.filament_sensor:
             objects: List[str]
             objects = await self.klippy_apis.get_object_list(default=[])
@@ -598,7 +603,10 @@ class SimplyPrint(Subscribable):
                 fstate = "loaded" if detected else "runout"
                 self.cache.filament_state = fstate
                 self.send_sp("filament_sensor", {"state": fstate})
-        self.amb_detect.start()
+            if has_amb_sensor and cfg_amb_sensor in status:
+                self.amb_detect.update_ambient(status[cfg_amb_sensor])
+        if not has_amb_sensor:
+            self.amb_detect.start()
         self.printer_info_timer.start(delay=1.)
 
     def _on_power_changed(self, device_info: Dict[str, Any]) -> None:
@@ -675,6 +683,8 @@ class SimplyPrint(Subscribable):
             job_info["started"] = True
         self.layer_detect.start(metadata)
         self._send_job_event(job_info)
+        self.webcam_stream.reset_ai_scores()
+        self.webcam_stream.start_ai(120.)
 
     def _check_job_started(
         self,
@@ -702,10 +712,13 @@ class SimplyPrint(Subscribable):
         self.send_sp("job_info", {"paused": True})
         self._update_state("paused")
         self.layer_detect.stop()
+        self.webcam_stream.stop_ai()
 
     def _on_print_resumed(self, *args) -> None:
         self._update_state("printing")
         self.layer_detect.resume()
+        self.webcam_stream.reset_ai_scores()
+        self.webcam_stream.start_ai(self.intervals["ai"])
 
     def _on_print_cancelled(self, *args) -> None:
         self._check_job_started(*args)
@@ -714,6 +727,7 @@ class SimplyPrint(Subscribable):
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
+        self.webcam_stream.stop_ai()
 
     def _on_print_error(self, *args) -> None:
         self._check_job_started(*args)
@@ -726,6 +740,7 @@ class SimplyPrint(Subscribable):
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
+        self.webcam_stream.stop_ai()
 
     def _on_print_complete(self, *args) -> None:
         self._check_job_started(*args)
@@ -734,11 +749,13 @@ class SimplyPrint(Subscribable):
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
+        self.webcam_stream.stop_ai()
 
     def _on_print_standby(self, *args) -> None:
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
+        self.webcam_stream.stop_ai()
 
     def _on_pause_requested(self) -> None:
         self._print_request_event.set()
@@ -796,6 +813,10 @@ class SimplyPrint(Subscribable):
     def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
         for printer_obj, vals in status.items():
             self.printer_status[printer_obj].update(vals)
+        if self.amb_detect.sensor_name in status:
+            self.amb_detect.update_ambient(
+                status[self.amb_detect.sensor_name], eventtime
+            )
         self._update_temps(eventtime)
         if "bed_mesh" in status:
             self._send_mesh_data()
@@ -815,11 +836,16 @@ class SimplyPrint(Subscribable):
             self._update_job_progress()
         return eventtime + self.intervals["job"]
 
+    def _handle_sp_ping(self, eventtime: float) -> float:
+        self._last_sp_ping = eventtime
+        self.send_sp("ping", None)
+        return eventtime + self.intervals["ping"]
+
     def _update_job_progress(self) -> None:
         job_info: Dict[str, Any] = {}
         est_time = self.cache.metadata.get("estimated_time")
+        last_stats: Dict[str, Any] = self.job_state.get_last_stats()
         if est_time is not None:
-            last_stats: Dict[str, Any] = self.job_state.get_last_stats()
             duration: float = last_stats["print_duration"]
             time_left = max(0, int(est_time - duration + .5))
             last_time_left = self.cache.job_info.get("time", time_left + 60.)
@@ -834,7 +860,9 @@ class SimplyPrint(Subscribable):
             pct_prog = int(progress * 100 + .5)
             if pct_prog != self.cache.job_info.get("progress", 0):
                 job_info["progress"] = int(progress * 100 + .5)
-        layer = self.layer_detect.layer
+        layer: Optional[int] = last_stats.get("info", {}).get("current_layer")
+        if layer is None:
+            layer = self.layer_detect.layer
         if layer != self.cache.job_info.get("layer", -1):
             job_info["layer"] = layer
         if job_info:
@@ -1069,18 +1097,7 @@ class SimplyPrint(Subscribable):
                 self._logger.info(f"sent: {packet}")
             else:
                 self._logger.info("sent: webcam stream")
-            self._reset_keepalive()
         return True
-
-    def _reset_keepalive(self):
-        if self.keepalive_hdl is not None:
-            self.keepalive_hdl.cancel()
-        self.keepalive_hdl = self.eventloop.delay_callback(
-            KEEPALIVE_TIME, self._do_keepalive)
-
-    def _do_keepalive(self):
-        self.keepalive_hdl = None
-        self.send_sp("keepalive", None)
 
     def _get_object_diff(
         self, new_obj: Dict[str, Any], cached_obj: Dict[str, Any]
@@ -1096,17 +1113,15 @@ class SimplyPrint(Subscribable):
 
     async def close(self):
         self.print_handler.cancel()
-        self.webcam_stream.stop()
+        self.webcam_stream.stop_ai()
         self.amb_detect.stop()
         self.printer_info_timer.stop()
+        self.ping_sp_timer.stop()
         await self.send_sp("shutdown", None)
         self._logger.close()
         self.is_closing = True
         if self.ws is not None:
             self.ws.close(1001, "Client Shutdown")
-        if self.keepalive_hdl is not None:
-            self.keepalive_hdl.cancel()
-            self.keepalive_hdl = None
         if (
             self.connection_task is not None and
             not self.connection_task.done()
@@ -1158,12 +1173,33 @@ class AmbientDetect:
         self._ambient = initial_ambient
         self._last_sample_time: float = 0.
         self._update_interval = AMBIENT_CHECK_TIME
-        eventloop = self.server.get_event_loop()
-        self._detect_timer = eventloop.register_timer(self._handle_detect_timer)
+        self.eventloop = self.server.get_event_loop()
+        self._detect_timer = self.eventloop.register_timer(
+            self._handle_detect_timer
+        )
+        self._sensor_name: str = config.get("ambient_sensor", "")
 
     @property
     def ambient(self) -> int:
         return self._ambient
+
+    @property
+    def sensor_name(self) -> str:
+        return self._sensor_name
+
+    def update_ambient(
+        self, sensor_info: Dict[str, Any], eventtime: float = SAMPLE_CHECK_TIME
+    ) -> None:
+        if "temperature" not in sensor_info:
+            return
+        if eventtime < self._last_sample_time + SAMPLE_CHECK_TIME:
+            return
+        self._last_sample_time = eventtime
+        new_amb = int(sensor_info["temperature"] + .5)
+        if abs(new_amb - self._ambient) < 2:
+            return
+        self._ambient = new_amb
+        self._on_ambient_changed(self._ambient)
 
     def _handle_detect_timer(self, eventtime: float) -> float:
         if "tool0" not in self.cache.temps:
@@ -1212,6 +1248,7 @@ class AmbientDetect:
 
     def stop(self) -> None:
         self._detect_timer.stop()
+        self._last_sample_time = 0.
 
 class LayerDetect:
     def __init__(self) -> None:
@@ -1277,6 +1314,8 @@ class LayerDetect:
 # Ideally we will always fetch from the localhost rather than
 # go through the reverse proxy
 FALLBACK_URL = "http://127.0.0.1:8080/?action=snapshot"
+SP_SNAPSHOT_URL = "https://apirewrite.simplyprint.io/jobs/ReceiveSnapshot"
+SP_AI_URL = "https://ai.simplyprint.io/api/v2/infer"
 
 class WebcamStream:
     def __init__(
@@ -1288,11 +1327,12 @@ class WebcamStream:
         self.webcam_name = config.get("webcam_name", "")
         self.url = FALLBACK_URL
         self.client: HttpClient = self.server.lookup_component("http_client")
-        self.running = False
-        self.interval: float = 1.
-        self.stream_task: Optional[asyncio.Task] = None
         self.cam: Optional[WebCam] = None
         self._connected = False
+        self.ai_running = False
+        self.ai_task: Optional[asyncio.Task] = None
+        self.ai_scores: List[Any] = []
+        self.failed_ai_attempts = 0
 
     @property
     def connected(self) -> bool:
@@ -1330,77 +1370,109 @@ class WebcamStream:
             return {}
         return self.cam.as_dict()
 
-    async def extract_image(self) -> bytes:
+    async def extract_image(self) -> str:
         headers = {"Accept": "image/jpeg"}
         resp = await self.client.get(self.url, headers, enable_cache=False)
-        if resp.has_error():
-            # TODO: We should probably log an error and quit the
-            # stream here
-            return b""
-        return resp.content
+        resp.raise_for_status()
+        return await self.eventloop.run_in_thread(
+            self._encode_image, resp.content
+        )
 
-    def encode_image(self, image: bytes) -> str:
+    def _encode_image(self, image: bytes) -> str:
         return base64.b64encode(image).decode()
 
-    def _send_image(self, base_image: str) -> Optional[Coroutine]:
-        self.simplyprint.send_sp("stream", {"base": base_image})
-        return None
-
-    async def _stream(self) -> None:
-        last_err = Exception()
-        while self.running:
-            await asyncio.sleep(self.interval)
-            try:
-                ret = await self.extract_image()
-                if ret:
-                    encoded = await self.eventloop.run_in_thread(
-                        self.encode_image, ret
-                    )
-                    coro = self._send_image(encoded)
-                    if coro is not None:
-                        await coro
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                if not self.server.is_debug_enabled():
-                    continue
-                if type(last_err) != type(e) or last_err.args != e.args:
-                    last_err = e
-                    cname = self.__class__.__name__
-                    logging.exception(f"SimplyPrint {cname} Error")
-
-    def start(self, interval: float) -> None:
-        if self.running:
-            if interval == self.interval:
+    async def post_image(self, payload: Dict[str, Any]) -> None:
+        uid: Optional[str] = payload.get("id")
+        timer: Optional[int] = payload.get("timer")
+        try:
+            if uid is not None:
+                url = payload.get("endpoint", SP_SNAPSHOT_URL)
+                img = await self.extract_image()
+                headers = {
+                    "User-Agent": "Mozilla/5.0",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                }
+                body = f"id={url_escape(uid)}&image={url_escape(img)}"
+                resp = await self.client.post(
+                    url, body=body, headers=headers, enable_cache=False
+                )
+                resp.raise_for_status()
+            elif timer is not None:
+                await asyncio.sleep(timer / 1000)
+                img = await self.extract_image()
+                self.simplyprint.send_sp("stream", {"base": img})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if not self.server.is_verbose_enabled():
                 return
-            self.stop()
-        self.interval = interval
-        self.running = True
-        self.stream_task = self.eventloop.create_task(self._stream())
+            logging.exception("SimplyPrint WebCam Stream Error")
 
-    def stop(self) -> None:
-        if not self.running:
-            return
-        self.running = False
-        if self.stream_task is not None:
-            self.stream_task.cancel()
-            self.stream_task = None
-
-class AIStream(WebcamStream):
-    ai_url = "https://ai.simplyprint.io/api/v2/infer"
-
-    async def _send_image(self, base_image: str) -> None:
-        token = self.simplyprint.sp_info["printer_token"]
+    async def _send_ai_image(self, base_image: str) -> None:
+        interval = self.simplyprint.intervals["ai"]
         headers = {"User-Agent": "Mozilla/5.0"}
         data = {
-            "api_key": token,
+            "api_key": self.simplyprint.sp_info["printer_token"],
             "image_array": base_image,
-            "interval": self.interval
+            "interval": interval,
+            "printer_id": self.simplyprint.sp_info["printer_id"],
+            "settings": {
+                "buffer_percent": 80,
+                "confidence": 60,
+                "buffer_length": 16
+            },
+            "scores": self.ai_scores
         }
         resp = await self.client.post(
-            self.ai_url, body=data, headers=headers, enable_cache=False
+            SP_AI_URL, body=data, headers=headers, enable_cache=False
         )
         resp.raise_for_status()
+        self.failed_ai_attempts = 0
+        resp_json = resp.json()
+        if isinstance(resp_json, dict):
+            self.ai_scores = resp_json.get("scores", self.ai_scores)
+            ai_result = resp_json.get("s1", [0, 0, 0])
+            self.simplyprint.send_sp("ai_resp", {"ai": ai_result})
+
+    async def _ai_stream(self, delay: float) -> None:
+        if delay:
+            await asyncio.sleep(delay)
+        while self.ai_running:
+            interval = self.simplyprint.intervals["ai"]
+            try:
+                img = await self.extract_image()
+                await self._send_ai_image(img)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.failed_ai_attempts += 1
+                if self.failed_ai_attempts == 1:
+                    logging.exception("SimplyPrint AI Stream Error")
+                elif not self.failed_ai_attempts % 10:
+                    logging.info(
+                        f"SimplyPrint: {self.failed_ai_attempts} consecutive "
+                        "AI failures"
+                    )
+                delay = min(120., self.failed_ai_attempts * 5.0)
+                interval = self.simplyprint.intervals["ai"] + delay
+            await asyncio.sleep(interval)
+
+    def reset_ai_scores(self):
+        self.ai_scores = []
+
+    def start_ai(self, delay: float = 0) -> None:
+        if self.ai_running:
+            self.stop_ai()
+        self.ai_running = True
+        self.ai_task = self.eventloop.create_task(self._ai_stream(delay))
+
+    def stop_ai(self) -> None:
+        if not self.ai_running:
+            return
+        self.ai_running = False
+        if self.ai_task is not None:
+            self.ai_task.cancel()
+            self.ai_task = None
 
 class PrintHandler:
     def __init__(self, simplyprint: SimplyPrint) -> None:
@@ -1556,7 +1628,7 @@ class ProtoLogger:
     def __init__(self, config: ConfigHelper) -> None:
         server = config.get_server()
         self._logger: Optional[logging.Logger] = None
-        if not config["server"].getboolean("enable_debug_logging", False):
+        if not server.is_verbose_enabled():
             return
         fm: FileManager = server.lookup_component("file_manager")
         log_root = fm.get_directory("logs")

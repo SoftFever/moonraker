@@ -1071,6 +1071,10 @@ Returns: Information about the host system in the following format:
             "klipper_mcu",
             "moonraker"
         ],
+        "instance_ids": {
+            "moonraker": "moonraker",
+            "klipper": "klipper"
+        },
         "service_state": {
             "klipper": {
                 "active_state": "active",
@@ -1165,9 +1169,18 @@ This request will not return.  The machine will reboot
 and the socket connection will drop.
 
 #### Restart a system service
-Restarts a system service via `sudo systemctl restart {name}`. Currently
-the `moonraker`, `klipper`, `MoonCord`, `KlipperScreen` and `webcamd`
-services are supported.
+Uses: `sudo systemctl restart {name}`
+
+Services allowed:
+
+* `crowsnest`
+* `MoonCord`
+* `moonraker`
+* `moonraker-telegram-bot`
+* `klipper`
+* `KlipperScreen`
+* `sonar`
+* `webcamd`
 
 HTTP request:
 ```http
@@ -1186,8 +1199,10 @@ JSON-RPC request:
 
 Returns:
 
-`ok` when complete.  Note that if `moonraker` is chosen, the return
-value will be sent prior to the service restart.
+`ok` when complete.
+!!! note
+    If `moonraker` is chosen, the return
+    value will be sent prior to the service restart.
 
 #### Stop a system service
 Stops a system service via `sudo systemctl stop <name>`. Currently
@@ -1356,36 +1371,61 @@ object reports total cpu usage, while each `cpuX` field is usage per core.
 The `websocket_connections` field reports the number of active websockets
 currently connected to moonraker.
 
-#### Check sudo access
-Checks if Moonraker has permission to run commands as root.
+#### Get Sudo Info
+Retrieve sudo information status.  Optionally checks if Moonraker has
+permission to run commands as root.
 
 HTTP request:
 ```http
-GET /machine/sudo
+GET /machine/sudo/info?check_access=false
 ```
 
 JSON-RPC request:
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "machine.sudo",
+    "method": "machine.sudo.info",
+    "params": {
+        "check_access": false
+    },
     "id": 7896
 }
 ```
+
+Parameters:
+
+- `check_access`: A boolean value, when set to `true` Moonraker will
+  attempt to run a command with elevated permissions.  The result will
+  be returned in the `sudo_access` field of the response.  Defaults to
+  `false`.
+
 Returns:
 
 An object in the following format:
-
 ```json
 {
-    "sudo_access": true
+    "sudo_access": null,
+    "linux_user": "pi",
+    "sudo_requested": false,
+    "request_messages": []
 }
 ```
+
+- `sudo_access`:  The result of a request to check access.  Returns
+  `true` if Moonraker has sudo permission, `false` if it does not,
+  and `null` if `check_access` is `false`.
+- `linux_user`:  The current linux user running Moonraker.
+- `sudo_requested`:  Returns true if Moonraker is currently requesting
+  sudo access.
+- `request_messages`:  An array of strings, each string describing
+  a pending sudo request.  The array will be empty if no sudo
+  requests are pending.
 
 #### Set sudo password
 Sets/updates the sudo password currently used by Moonraker.  When
 the password is set using this endpoint the change is not persistent
-across restarts.
+across restarts.  If Moonraker has one or more pending sudo requests
+they will be processed.
 
 HTTP request:
 ```http
@@ -1408,10 +1448,32 @@ JSON-RPC request:
     "id": 7896
 }
 ```
+
+Parameters:
+
+- `password`:  The linux user password used to grant elevated
+  permission.  This parameter must be provided.
+
 Returns:
 
-`ok` on success.  If the new password does not grant root permissions
-the request will return with an error.
+An object in the following format:
+```json
+{
+    "sudo_responses": [
+        "Sudo password successfully set."
+    ],
+    "is_restarting": false
+}
+```
+
+- `sudo_responses`: An array of one or more sudo responses.
+  If there are pending sudo requests each request will provide
+  a response.
+- `is_restarting`: A boolean value indicating that a sudo request
+  prompted Moonraker to restart its service.
+
+This request will return an error if the supplied password is
+incorrect or if any pending sudo requests fail.
 
 ### File Operations
 
@@ -2271,6 +2333,7 @@ HTTP request:
 ```http
 GET /server/database/list
 ```
+
 JSON-RPC request:
 ```json
 {
@@ -4874,6 +4937,133 @@ Returns:
 returned.  Once received, Moonraker will broadcast this event via
 the [agent event notification](#agent-events) to all other connections.
 
+### Debug APIs
+
+The APIs in this section are available when Moonraker the debug argument
+(`-g`) has been supplied via the command line.  Some API may also depend
+on Moonraker's configuration, ie: an optional component may choose to
+register a debug API.
+
+!!! Warning
+    Debug APIs may expose security vulnerabilities.  They should only be
+    enabled by developers on secured machines.
+
+#### List Database Namespaces (debug)
+
+Debug version of [List Namespaces](#list-namespaces). Return value includes
+namespaces exlusively reserved for Moonraker. Only availble when Moonraker's
+debug features are enabled.
+
+
+HTTP request:
+```http
+GET /debug/database/list
+```
+
+JSON-RPC request:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "debug.database.list",
+    "id": 8694
+}
+```
+
+#### Get Database Item (debug)
+
+Debug version of [Get Database Item](#get-database-item).  Keys within
+protected and forbidden namespaces are accessible. Only availble when
+Moonraker's debug features are enabled.
+
+!!! Warning
+    Moonraker's forbidden namespaces include items such as user credentials.
+    This endpoint should NOT be implemented in front ends directly.
+
+HTTP request:
+```http
+GET /debug/database/item?namespace={namespace}&key={key}
+```
+JSON-RPC request:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "debug.database.get_item",
+    "params": {
+        "namespace": "{namespace}",
+        "key": "{key}"
+    },
+    "id": 5644
+}
+```
+
+#### Add Database Item (debug)
+
+Debug version of [Add Database Item](#add-database-item).  Keys within
+protected and forbidden namespaces may be added. Only availble when
+Moonraker's debug features are enabled.
+
+!!! Warning
+    This endpoint should be used for testing/debugging purposes only.
+    Modifying protected namespaces outside of Moonraker can result in
+    broken functionality and is not supported for production environments.
+    Issues opened with reports/queries related to this endpoint will be
+    redirected to this documentation and closed.
+
+```http
+POST /debug/database/item
+Content-Type: application/json
+
+{
+    "namespace": "my_client",
+    "key": "settings.some_count",
+    "value": 100
+}
+```
+JSON-RPC request:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "debug.database.post_item",
+    "params": {
+        "namespace": "{namespace}",
+        "key": "{key}",
+        "value": 100
+    },
+    "id": 4654
+}
+```
+
+#### Delete Database Item (debug)
+
+Debug version of [Delete Database Item](#delete-database-item).  Keys within
+protected and forbidden namespaces may be removed. Only availble when
+Moonraker's debug features are enabled.
+
+!!! Warning
+    This endpoint should be used for testing/debugging purposes only.
+    Modifying protected namespaces outside of Moonraker can result in
+    broken functionality and is not supported for production environments.
+    Issues opened with reports/queries related to this endpoint will be
+    redirected to this documentation and closed.
+
+HTTP request:
+```http
+DELETE /debug/database/item?namespace={namespace}&key={key}
+```
+
+JSON-RPC request:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "debug.database.delete_item",
+    "params": {
+        "namespace": "{namespace}",
+        "key": "{key}"
+    },
+    "id": 4654
+}
+```
+
 ### Websocket notifications
 Printer generated events are sent over the websocket as JSON-RPC 2.0
 notifications.  These notifications are sent to all connected clients
@@ -5342,6 +5532,33 @@ a specified `wake_time` for a dismissed announcement has expired.
 The `params` array will contain an object with the `entry_id` of the
 announcement that is no longer dismissed.
 
+#### Sudo alert event
+Moonraker will emit the `notify_sudo_alert` notification when
+a component has requested sudo access.  The event is also emitted
+when a sudo request has been granted.
+
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "notify_sudo_alert",
+    "params": [
+        {
+            "sudo_requested": true,
+            "sudo_messages": [
+                "Sudo password required to update Moonraker's systemd service."
+            ]
+        }
+    ]
+}
+```
+
+The `params` array contains an object with the following fields:
+
+- `sudo_requested`:  Returns true if Moonraker is currently requesting
+  sudo access.
+- `request_messages`:  An array of strings, each string describing
+  a pending sudo request.  The array will be empty if no sudo
+  requests are pending.
 
 #### Agent Events
 Moonraker will emit the `notify_agent_event` notification when it
@@ -5798,7 +6015,7 @@ each entry is an object containing the following fields:
   the announcement.
 
 When a client first connects to Moonraker it is recommended that the
-[list announcements](#list-announcements) API is called to retreive
+[list announcements](#list-announcements) API is called to retrieve
 the current list of entries.  A client may then watch for the
 [announcement update](#announcement-update-event) and
 [announcement dismissed](#announcement-dismissed-event) notifications

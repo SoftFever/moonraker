@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from websockets import WebRequest, Subscribable
     from components.klippy_apis import KlippyAPI
     from components.file_manager.file_manager import FileManager
+    from components.machine import Machine
     from asyncio.trsock import TransportSocket
     FlexCallback = Callable[..., Optional[Coroutine]]
 
@@ -59,6 +60,7 @@ class KlippyConnection:
         self._klipper_version: str = ""
         self._missing_reqs: Set[str] = set()
         self._peer_cred: Dict[str, int] = {}
+        self._service_info: Dict[str, Any] = {}
         self.init_attempts: int = 0
         self._state: str = "disconnected"
         self._state_message: str = "Klippy Disconnected"
@@ -100,6 +102,16 @@ class KlippyConnection:
     @property
     def peer_credentials(self) -> Dict[str, int]:
         return dict(self._peer_cred)
+
+    @property
+    def service_info(self) -> Dict[str, Any]:
+        return self._service_info
+
+    @property
+    def unit_name(self) -> str:
+        svc_info = self._service_info
+        unit_name = svc_info.get("unit_name", "klipper.service")
+        return unit_name.split(".", 1)[0]
 
     async def wait_connected(self) -> bool:
         if (
@@ -226,29 +238,39 @@ class KlippyConnection:
                     continue
                 logging.info("Klippy Connection Established")
                 self.writer = writer
-                self._get_peer_credentials(writer)
+                if self._get_peer_credentials(writer):
+                    machine: Machine = self.server.lookup_component("machine")
+                    provider = machine.get_system_provider()
+                    props = ["Description", "ExecStart", "FragmentPath"]
+                    svc_info = await provider.extract_service_info(
+                        "klipper", self._peer_cred["process_id"], props
+                    )
+                    if svc_info != self._service_info:
+                        self._service_info = svc_info
+                        machine.log_service_info(svc_info)
             self.event_loop.create_task(self._read_stream(reader))
             return await self._init_klippy_connection()
 
-    def _get_peer_credentials(self, writer: asyncio.StreamWriter) -> None:
+    def _get_peer_credentials(self, writer: asyncio.StreamWriter) -> bool:
         sock: TransportSocket
         sock = writer.get_extra_info("socket", None)
         if sock is None:
             logging.debug(
                 "Unable to get Unix Socket, cant fetch peer credentials"
             )
-            return
+            return False
         data: bytes = b""
         try:
-            data = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-            pid, uid, gid = struct.unpack("@LLL", data)
+            size = struct.calcsize("3I")
+            data = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size)
+            pid, uid, gid = struct.unpack("3I", data)
         except asyncio.CancelledError:
             raise
         except Exception:
             logging.exception(
                 f"Failed to get Klippy Peer Credentials, raw: 0x{data.hex()}"
             )
-            return
+            return False
         self._peer_cred = {
             "process_id": pid,
             "user_id": uid,
@@ -257,6 +279,7 @@ class KlippyConnection:
         logging.debug(
             f"Klippy Connection: Received Peer Credentials: {self._peer_cred}"
         )
+        return True
 
     async def _init_klippy_connection(self) -> bool:
         self.init_list = []
@@ -389,8 +412,7 @@ class KlippyConnection:
                 if vsd_path is not None:
                     file_manager: FileManager = self.server.lookup_component(
                         'file_manager')
-                    file_manager.register_directory('gcodes', vsd_path,
-                                                    full_access=True)
+                    file_manager.validate_gcode_path(vsd_path)
                 else:
                     logging.info(
                         "Configuration for [virtual_sdcard] not found,"

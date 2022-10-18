@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from components.dbus_manager import DbusManager
     from components.machine import Machine
     from components.http_client import HttpClient
+    from components.file_manager.file_manager import FileManager
     from eventloop import FlexTimer
     from dbus_next import Variant
     from dbus_next.aio import ProxyInterface
@@ -244,6 +245,14 @@ class UpdateManager:
                 return eventtime + UPDATE_REFRESH_INTERVAL
         vinfo: Dict[str, Any] = {}
         need_notify = False
+        machine: Machine = self.server.lookup_component("machine")
+        if machine.validation_enabled():
+            logging.info(
+                "update_manger: Install validation pending, bypassing "
+                "initial refresh"
+            )
+            self.initial_refresh_complete = True
+            return eventtime + UPDATE_REFRESH_INTERVAL
         async with self.cmd_request_lock:
             try:
                 for name, updater in list(self.updaters.items()):
@@ -388,11 +397,16 @@ class UpdateManager:
         # Override a request to refresh if:
         #   - An update is in progress
         #   - Klippy is printing
+        #   - Validation is pending
+        machine: Machine = self.server.lookup_component("machine")
         if (
+            machine.validation_enabled() or
             self.cmd_helper.is_update_busy() or
             await self._check_klippy_printing() or
             not self.initial_refresh_complete
         ):
+            if check_refresh:
+                logging.info("update_manager: bypassing refresh request")
             check_refresh = False
 
         if check_refresh:
@@ -403,6 +417,7 @@ class UpdateManager:
             lrt = max([upd.get_last_refresh_time()
                        for upd in self.updaters.values()])
             if time.time() < lrt + 60.:
+                logging.debug("update_manager: refresh bypassed due to spam")
                 check_refresh = False
                 self.cmd_request_lock.release()
         vinfo: Dict[str, Any] = {}
@@ -463,8 +478,8 @@ class CommandHelper:
         self.server = config.get_server()
         self.http_client: HttpClient
         self.http_client = self.server.lookup_component("http_client")
-        self.debug_enabled = config.getboolean('enable_repo_debug', False)
-        if self.debug_enabled:
+        config.getboolean('enable_repo_debug', False, deprecate=True)
+        if self.server.is_debug_enabled():
             logging.warning("UPDATE MANAGER: REPO DEBUG ENABLED")
         shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
         self.scmd_error = shell_cmd.error
@@ -504,9 +519,6 @@ class CommandHelper:
 
     def get_umdb(self) -> NamespaceWrapper:
         return self.umdb
-
-    def is_debug_enabled(self) -> bool:
-        return self.debug_enabled
 
     def set_update_info(self, app: str, uid: int) -> None:
         self.cur_update_app = app
@@ -1133,6 +1145,8 @@ class WebClientDeploy(BaseDeploy):
         self.repo = config.get('repo').strip().strip("/")
         self.owner = self.repo.split("/", 1)[0]
         self.path = pathlib.Path(config.get("path")).expanduser().resolve()
+        fm: FileManager = self.server.lookup_component("file_manager")
+        fm.add_reserved_path(f"update_manager {self.name}", self.path)
         self.type = config.get('type')
         def_channel = "stable"
         if self.type == "web_beta":
