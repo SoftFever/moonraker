@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from klippy_connection import KlippyConnection as Klippy
     from components.file_manager.file_manager import FileManager
     from components.announcements import Announcements
+    from components.machine import Machine
     from io import BufferedReader
     import components.authorization
     MessageDelgate = Optional[tornado.httputil.HTTPMessageDelegate]
@@ -64,7 +65,7 @@ RESERVED_ENDPOINTS = [
 # 50 MiB Max Standard Body Size
 MAX_BODY_SIZE = 50 * 1024 * 1024
 EXCLUDED_ARGS = ["_", "token", "access_token", "connection_id"]
-AUTHORIZED_EXTS = [".png"]
+AUTHORIZED_EXTS = [".png", ".jpg"]
 DEFAULT_KLIPPY_LOG_PATH = "/tmp/klippy.log"
 ALL_TRANSPORTS = ["http", "websocket", "mqtt", "internal"]
 ASSET_PATH = pathlib.Path(__file__).parent.joinpath("assets")
@@ -176,9 +177,9 @@ class MoonrakerApp:
         self.max_upload_size *= 1024 * 1024
 
         # SSL config
-        self.cert_path: str = self._get_path_option(
+        self.cert_path: pathlib.Path = self._get_path_option(
             config, 'ssl_certificate_path')
-        self.key_path: str = self._get_path_option(
+        self.key_path: pathlib.Path = self._get_path_option(
             config, 'ssl_key_path')
 
         # Set Up Websocket and Authorization Managers
@@ -193,9 +194,8 @@ class MoonrakerApp:
         mimetypes.add_type('text/plain', '.gcode')
         mimetypes.add_type('text/plain', '.cfg')
 
-        self.debug = self.server.is_debug_enabled()
         app_args: Dict[str, Any] = {
-            'serve_traceback': self.debug,
+            'serve_traceback': self.server.is_verbose_enabled(),
             'websocket_ping_interval': 10,
             'websocket_ping_timeout': 30,
             'server': self.server,
@@ -231,16 +231,29 @@ class MoonrakerApp:
         self.server.register_component("internal_transport",
                                        self.internal_transport)
 
-    def _get_path_option(self, config: ConfigHelper, option: str) -> str:
-        path: Optional[str] = config.get(option, None)
-        if path is None:
-            return ""
-        expanded = os.path.abspath(os.path.expanduser(path))
-        if not os.path.exists(expanded):
+    def _get_path_option(
+        self, config: ConfigHelper, option: str
+    ) -> pathlib.Path:
+        path: Optional[str] = config.get(option, None, deprecate=True)
+        app_args = self.server.get_app_args()
+        data_path = app_args["data_path"]
+        certs_path = pathlib.Path(data_path).joinpath("certs")
+        if not certs_path.exists():
+            try:
+                certs_path.mkdir()
+            except Exception:
+                pass
+        ext = "key" if "key" in option else "cert"
+        item = certs_path.joinpath(f"moonraker.{ext}")
+        if item.exists() or path is None:
+            return item
+        item = pathlib.Path(path).expanduser().resolve()
+        if not item.exists():
             raise self.server.error(
                 f"Invalid path for option '{option}', "
-                f"{path} does not exist")
-        return expanded
+                f"{path} does not exist"
+            )
+        return item
 
     def listen(self, host: str, port: int, ssl_port: int) -> None:
         if host.lower() == "all":
@@ -248,7 +261,7 @@ class MoonrakerApp:
         self.http_server = self.app.listen(
             port, address=host, max_body_size=MAX_BODY_SIZE,
             xheaders=True)
-        if os.path.exists(self.cert_path) and os.path.exists(self.key_path):
+        if self.https_enabled():
             logging.info(f"Starting secure server on port {ssl_port}")
             ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             ssl_ctx.load_cert_chain(self.cert_path, self.key_path)
@@ -261,7 +274,10 @@ class MoonrakerApp:
 
     def log_request(self, handler: tornado.web.RequestHandler) -> None:
         status_code = handler.get_status()
-        if not self.debug and status_code in [200, 204, 206, 304]:
+        if (
+            not self.server.is_verbose_enabled()
+            and status_code in [200, 204, 206, 304]
+        ):
             # don't log successful requests in release mode
             return
         if status_code < 400:
@@ -284,6 +300,9 @@ class MoonrakerApp:
 
     def get_asset_path(self) -> pathlib.Path:
         return ASSET_PATH
+
+    def https_enabled(self) -> bool:
+        return self.cert_path.exists() and self.key_path.exists()
 
     async def close(self) -> None:
         if self.http_server is not None:
@@ -375,6 +394,24 @@ class MoonrakerApp:
         if location_prefix is not None:
             params['location_prefix'] = location_prefix
         self.mutable_router.add_handler(pattern, FileUploadHandler, params)
+
+    def register_debug_handler(
+        self,
+        uri: str,
+        request_methods: List[str],
+        callback: APICallback,
+        transports: List[str] = ALL_TRANSPORTS,
+        wrap_result: bool = True
+    ) -> None:
+        if not self.server.is_debug_enabled():
+            return
+        if not uri.startswith("/debug"):
+            raise self.server.error(
+                "Debug Endpoints must be registerd in the '/debug' path"
+            )
+        self.register_local_handler(
+            uri, request_methods, callback, transports, wrap_result
+        )
 
     def remove_handler(self, endpoint: str) -> None:
         api_def = self.api_cache.pop(endpoint, None)
@@ -603,10 +640,13 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         return args
 
     def _log_debug(self, header: str, args: Any) -> None:
-        if self.server.is_debug_enabled():
+        if self.server.is_verbose_enabled():
             resp = args
             if isinstance(args, dict):
-                if self.request.path.startswith('/access'):
+                if (
+                    self.request.path.startswith("/access") or
+                    self.request.path.startswith("/machine/sudo/password")
+                ):
                     resp = {key: "<sanitized>" for key in args}
             elif isinstance(args, str):
                 if args.startswith("<html>"):
@@ -629,7 +669,7 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         assert callable(self.callback)
         return await self.callback(
             WebRequest(self.request.path, args, self.request.method,
-                       conn=conn, ip_addr=self.request.remote_ip,
+                       conn=conn, ip_addr=self.request.remote_ip or "",
                        user=self.current_user))
 
     async def _do_remote_request(self,
@@ -640,7 +680,7 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         klippy: Klippy = self.server.lookup_component("klippy_connection")
         return await klippy.request(
             WebRequest(self.callback, args, conn=conn,
-                       ip_addr=self.request.remote_ip,
+                       ip_addr=self.request.remote_ip or "",
                        user=self.current_user))
 
     async def _process_http_request(self) -> None:
@@ -654,7 +694,7 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
             result = await self._do_request(args, conn)
         except ServerError as e:
             raise tornado.web.HTTPError(
-                e.status_code, str(e)) from e
+                e.status_code, reason=str(e)) from e
         if self.wrap_result:
             result = {'result': result}
         if result is None:
@@ -679,15 +719,12 @@ class FileRequestHandler(AuthorizedFileHandler):
     async def delete(self, path: str) -> None:
         path = self.request.path.lstrip("/").split("/", 2)[-1]
         path = url_unescape(path, plus=False)
+        file_manager: FileManager
         file_manager = self.server.lookup_component('file_manager')
         try:
             filename = await file_manager.delete_file(path)
         except self.server.error as e:
-            if e.status_code == 403:
-                raise tornado.web.HTTPError(
-                    403, "File is loaded, DELETE not permitted")
-            else:
-                raise tornado.web.HTTPError(e.status_code, str(e))
+            raise tornado.web.HTTPError(e.status_code, str(e))
         self.finish({'result': filename})
 
     async def get(self, path: str, include_body: bool = True) -> None:
@@ -699,6 +736,12 @@ class FileRequestHandler(AuthorizedFileHandler):
             self.root, absolute_path)
         if self.absolute_path is None:
             return
+        file_manager: FileManager
+        file_manager = self.server.lookup_component('file_manager')
+        try:
+            file_manager.check_reserved_path(self.absolute_path, False)
+        except self.server.error as e:
+            raise tornado.web.HTTPError(e.status_code, str(e))
 
         self.modified = self.get_modified_time()
         self.set_headers()
@@ -835,6 +878,8 @@ class FileUploadHandler(AuthorizedRequestHandler):
 
     def prepare(self) -> None:
         super(FileUploadHandler, self).prepare()
+        fm: FileManager = self.server.lookup_component("file_manager")
+        fm.check_write_enabled()
         if self.request.method == "POST":
             assert isinstance(self.request.connection, HTTP1Connection)
             self.request.connection.set_max_body_size(self.max_upload_size)
@@ -1013,8 +1058,11 @@ class WelcomeHandler(tornado.web.RequestHandler):
         ancomp: Announcements
         ancomp = self.server.lookup_component("announcements")
         wsm: WebsocketManager = self.server.lookup_component("websockets")
+        machine: Machine = self.server.lookup_component("machine")
+        svc_info = machine.get_moonraker_service_info()
+        sudo_req_msg = "<br/>".join(machine.sudo_request_messages)
         context: Dict[str, Any] = {
-            "ip_address": self.request.remote_ip,
+            "remote_ip": self.request.remote_ip,
             "authorized": authorized,
             "cors_enabled": cors_enabled,
             "version": self.server.get_app_args()["software_version"],
@@ -1022,7 +1070,13 @@ class WelcomeHandler(tornado.web.RequestHandler):
             "klippy_state": kstate,
             "warnings": self.server.get_warnings(),
             "summary": summary,
-            "announcements": await ancomp.get_announcements()
+            "announcements": await ancomp.get_announcements(),
+            "sudo_requested": machine.sudo_requested,
+            "sudo_request_message": sudo_req_msg,
+            "linux_user": machine.linux_user,
+            "local_ip": machine.public_ip or "unknown",
+            "service_name": svc_info.get("unit_name", "unknown"),
+            "hostname": self.server.get_host_info()["hostname"],
         }
         self.render("welcome.html", **context)
 

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from confighelper import ConfigHelper
     from .update_manager import CommandHelper
     from ..machine import Machine
+    from ..file_manager.file_manager import FileManager
 
 SUPPORTED_CHANNELS = {
     "zip": ["stable", "beta"],
@@ -40,7 +41,6 @@ class AppDeploy(BaseDeploy):
     def __init__(self, config: ConfigHelper, cmd_helper: CommandHelper) -> None:
         super().__init__(config, cmd_helper, prefix="Application")
         self.config = config
-        self.debug = self.cmd_helper.is_debug_enabled()
         type_choices = list(TYPE_TO_CHANNEL.keys())
         self.type = config.get('type').lower()
         if self.type not in type_choices:
@@ -60,6 +60,12 @@ class AppDeploy(BaseDeploy):
             self.type = "zip"
         self.path = pathlib.Path(
             config.get('path')).expanduser().resolve()
+        if (
+            self.name not in ["moonraker", "klipper"]
+            and not self.path.joinpath(".writeable").is_file()
+        ):
+            fm: FileManager = self.server.lookup_component("file_manager")
+            fm.add_reserved_path(f"update_manager {self.name}", self.path)
         executable = config.get('env', None)
         if self.channel not in SUPPORTED_CHANNELS[self.type]:
             raise config.error(
@@ -97,7 +103,7 @@ class AppDeploy(BaseDeploy):
             if svc not in svc_choices:
                 raw = " ".join(services)
                 self.server.add_warning(
-                    f"[{config.get_name()}]: Option 'restart_action: {raw}' "
+                    f"[{config.get_name()}]: Option 'managed_services: {raw}' "
                     f"contains an invalid value '{svc}'.  All values must be "
                     f"one of the following choices: {svc_choices}"
                 )
@@ -217,7 +223,7 @@ class AppDeploy(BaseDeploy):
     def get_update_status(self) -> Dict[str, Any]:
         return {
             'channel': self.channel,
-            'debug_enabled': self.debug,
+            'debug_enabled': self.server.is_debug_enabled(),
             'need_channel_update': self.need_channel_update,
             'is_valid': self._is_valid,
             'configured_type': self.type,
